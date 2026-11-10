@@ -1,8 +1,8 @@
+<h1 align="center">SufTTY</h1>
+
 <p align="center">
   <img src="assets/banner.png" alt="SufTTY - The web, in your terminal." width="100%">
 </p>
-
-# SufTTY
 
 A real browser that runs inside your terminal
 
