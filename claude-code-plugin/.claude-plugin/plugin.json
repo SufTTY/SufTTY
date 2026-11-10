@@ -1,0 +1,24 @@
+{
+  "name": "suftty",
+  "version": "0.0.2",
+  "description": "A browser running directly inside claude code. Preview websites, view HTML documents, and let your agent control the built in browser.",
+  "author": {
+    "name": "SufTTY"
+  },
+  "homepage": "https://github.com/SufTTY/suftty/tree/main/claude-code-plugin",
+  "repository": "https://github.com/SufTTY/suftty",
+  "license": "MIT",
+  "keywords": [
+    "browser",
+    "function-hooks"
+  ],
+  "types": "./hooks/browser.d.ts",
+  "userConfig": {
+    "agentTool": {
+      "type": "boolean",
+      "title": "Give the agent a tool to open/close suftty inside claude code",
+      "description": "Adds an open/close tool the model can call to show a page in the browser pane. Off by default.",
+      "default": false
+    }
+  }
+}

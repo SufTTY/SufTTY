@@ -1,0 +1,855 @@
+#!/usr/bin/env node
+import { execFileSync, spawn } from "node:child_process";
+import fs from "node:fs";
+import net from "node:net";
+import path from "node:path";
+import readline from "node:readline";
+
+import {
+  DAEMON_SOCKET,
+  LOGS_DIR,
+  TERMINAL_SOCKET_ENV,
+  appId,
+  ensureDataDir,
+  instanceKey,
+  listApps,
+  registerApp,
+  socketTerminal,
+  unregisterApp,
+} from "shared";
+import {
+  callerTty,
+  canSplit,
+  cannotOpenPanes,
+  checkTerminal,
+  detect,
+} from "@zenbu-labs/pixel/terminal";
+import { findOwner } from "@zenbu-labs/pixel/terminal";
+import type { Direction, Terminal, TerminalCheck } from "@zenbu-labs/pixel/terminal";
+import { actionCommand } from "./action";
+import { control } from "./control";
+import { ensureSetup, setupCommand } from "./setup";
+import { commandHelp, helpTopics, rootHelp } from "./help";
+import { browsers, describe, recordKey } from "./instances";
+import type { Browser } from "./instances";
+import { findHosts, openInHost } from "./interop";
+import { lsCommand } from "./ls";
+import { instances } from "./registry";
+import { apparmorSetup, deniedRefusal, linuxSandboxError, sandboxRefusal } from "./sandbox";
+import { appExecutable } from "@zenbu-labs/pixel/app-executable";
+import { connectSsh, validateSshTarget } from "@zenbu-labs/pixel/ssh";
+import type { InstanceRecord } from "./registry";
+import { installedVersion, upgradeCommand } from "./upgrade";
+import { claudeBridgeCommand } from "./claude-bridge";
+import { configCommand } from "./config";
+
+const DIST_ROOT = process.env.SUFTTY_DIST_ROOT ?? null;
+const CAPABILITIES = ["embedding", "image-frames"] as const;
+delete process.env.ELECTRON_RUN_AS_NODE;
+
+function fail(message: string): never {
+  process.stderr.write(`suftty: ${message}\n`);
+  process.exit(1);
+}
+
+function print(value: unknown) {
+  process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
+}
+
+function reportOpened(browser: string, tab?: number | string | null) {
+  const where = tab === undefined || tab === null ? browser : `tab ${tab} in ${browser}`;
+  process.stdout.write(`opened ${where} (suftty ls for details)\n`);
+}
+
+function takeFlag(args: string[], name: string): string | undefined {
+  const at = args.indexOf(name);
+  if (at < 0) return undefined;
+  const value = args[at + 1];
+  if (value === undefined) fail(`${name} requires a value`);
+  args.splice(at, 2);
+  return value;
+}
+
+function takeBoolFlag(args: string[], name: string): boolean {
+  const at = args.indexOf(name);
+  if (at < 0) return false;
+  args.splice(at, 1);
+  return true;
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const ELECTRON_DIST_BIN =
+  process.platform === "darwin"
+    ? ["suftty.app", "Contents", "MacOS", "suftty"]
+    : ["pixel"];
+const ELECTRON_DEV_BIN =
+  process.platform === "darwin"
+    ? ["Electron.app", "Contents", "MacOS", "pixel"]
+    : ["pixel"];
+
+function browserDirectory(): string {
+  return path.resolve(__dirname, "..", "..", "browser");
+}
+
+function electronBinary(): string {
+  const override = process.env.PIXEL_ELECTRON_APP;
+  if (override) return appExecutable(override);
+  if (DIST_ROOT) return path.join(DIST_ROOT, "electron", ...ELECTRON_DIST_BIN);
+  const library = require.resolve("@zenbu-labs/pixel/package.json", { paths: [browserDirectory()] });
+  return path.join(path.dirname(library), "electron", "dist", ...ELECTRON_DEV_BIN);
+}
+
+function browserLaunchCommand(argv: string[]): { command: string[]; cwd: string } {
+  const browserDir = browserDirectory();
+  let electron: string;
+  try {
+    electron = electronBinary();
+  } catch (error) {
+    fail((error as Error).message);
+  }
+  const main = path.join(browserDir, "dist", "main.js");
+  for (const required of [electron, main]) {
+    if (!fs.existsSync(required)) {
+      fail(`missing ${required} — build the browser first (pnpm --filter suftty build)`);
+    }
+  }
+  if (process.platform === "linux") {
+    let sandboxError = linuxSandboxError(electron);
+    if (sandboxError) {
+      apparmorSetup(electron);
+      sandboxError = linuxSandboxError(electron);
+    }
+    if (sandboxError) fail(sandboxError);
+  }
+  // headless ozone reports a 1x1 screen unless told otherwise:
+  // https://source.chromium.org/chromium/chromium/src/+/refs/tags/150.0.7871.212:ui/ozone/platform/headless/headless_screen.cc;l=37-46
+  if (process.platform === "linux" && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) {
+    argv = [...argv, "--ozone-platform=headless", "--screen-info={8192x8192}"];
+  }
+  ensureDataDir();
+  const logDir = LOGS_DIR;
+  fs.mkdirSync(logDir, { recursive: true });
+  const quoted = [electron, main, ...argv]
+    .map((arg) => `'${arg.replaceAll("'", `'\\''`)}'`)
+    .join(" ");
+  const line = `exec ${quoted} 2>>'${logDir.replaceAll("'", `'\\''`)}/stderr.log'`;
+  return { command: ["/bin/sh", "-c", line], cwd: browserDir };
+}
+
+function clientLaunchCommand(argv: string[]): string[] {
+  const runner = DIST_ROOT
+    ? [path.join(DIST_ROOT, "bin", "suftty")]
+    : [process.execPath, path.resolve(__dirname, "main.js")];
+  return [...runner, "open", ...argv];
+}
+
+function ownTtyPath(): string | null {
+  try {
+    const out = execFileSync("tty", {
+      stdio: ["inherit", "pipe", "ignore"],
+      encoding: "utf8",
+    }).trim();
+    return out.startsWith("/dev/") ? out : null;
+  } catch {
+    return null;
+  }
+}
+
+function interactiveTty(): string | null {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) return null;
+  return ownTtyPath();
+}
+
+function browserBuildStamp(): string {
+  const main = path.resolve(__dirname, "..", "..", "browser", "dist", "main.js");
+  try {
+    return `${Math.floor(fs.statSync(main).mtimeMs)} ${fs.realpathSync(electronBinary())}`;
+  } catch {
+    return "unknown";
+  }
+}
+
+function connectDaemon(): Promise<net.Socket> {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect(DAEMON_SOCKET);
+    socket.once("connect", () => resolve(socket));
+    socket.once("error", reject);
+  });
+}
+
+function spawnDaemon() {
+  const { command, cwd } = browserLaunchCommand(["--daemon"]);
+  const env = Object.fromEntries(
+    Object.entries(process.env).filter(([key]) => !key.startsWith("PIXEL_")),
+  );
+  env.NODE_ENV ??= "production";
+  const child = spawn(command[0], command.slice(1), { cwd, detached: true, stdio: "ignore", env });
+  child.unref();
+}
+
+async function daemonSocket(): Promise<net.Socket> {
+  try {
+    return await connectDaemon();
+  } catch {}
+  spawnDaemon();
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    try {
+      return await connectDaemon();
+    } catch {
+      await sleep(200);
+    }
+  }
+  throw new Error("daemon did not start");
+}
+
+interface DaemonReply {
+  ok?: boolean;
+  error?: string;
+  session?: string;
+  event?: string;
+  code?: number;
+  sessions?: number;
+}
+
+function nextReply(socket: net.Socket, onLine: (reply: DaemonReply) => void): void {
+  let buffer = "";
+  socket.on("data", (chunk) => {
+    buffer += chunk.toString("utf8");
+    let newline = buffer.indexOf("\n");
+    while (newline !== -1) {
+      const line = buffer.slice(0, newline);
+      buffer = buffer.slice(newline + 1);
+      newline = buffer.indexOf("\n");
+      try {
+        onLine(JSON.parse(line) as DaemonReply);
+      } catch {}
+    }
+  });
+}
+
+
+async function openSession(argv: string[], tty: string): Promise<{ socket: net.Socket; reply: DaemonReply }> {
+  const payload = {
+    cmd: "open",
+    tty,
+    argv,
+    env: process.env,
+    cwd: process.cwd(),
+  };
+  const ask = (socket: net.Socket, build: string | null) =>
+    new Promise<DaemonReply>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("daemon open timed out")), 20_000);
+      nextReply(socket, (reply) => {
+        clearTimeout(timer);
+        resolve(reply);
+      });
+      socket.once("close", () => {
+        clearTimeout(timer);
+        reject(new Error("daemon closed the connection"));
+      });
+      socket.write(`${JSON.stringify(build ? { ...payload, build } : payload)}\n`);
+    });
+  let socket = await daemonSocket();
+  let reply = await ask(socket, browserBuildStamp());
+  if (reply.ok === false && reply.error === "stale") {
+    socket.destroy();
+    await sleep(700);
+    socket = await daemonSocket();
+    reply = await ask(socket, browserBuildStamp());
+  }
+  if (reply.ok === false && reply.error === "stale") {
+    socket.destroy();
+    socket = await daemonSocket();
+    reply = await ask(socket, null);
+  }
+  return { socket, reply };
+}
+
+async function daemonPid(): Promise<number | null> {
+  for (const record of await instances()) {
+    try {
+      process.kill(record.pid, 0);
+      return record.pid;
+    } catch {}
+  }
+  return null;
+}
+
+async function gone(pid: number, within: number): Promise<boolean> {
+  const deadline = Date.now() + within;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return true;
+    }
+    await sleep(100);
+  }
+  return false;
+}
+
+async function shutdownDaemon(): Promise<number> {
+  let socket: net.Socket | null = null;
+  try {
+    socket = await connectDaemon();
+  } catch {}
+  const pid = await daemonPid();
+  if (!socket) {
+    if (pid === null) {
+      process.stdout.write("no daemon running\n");
+      return 0;
+    }
+    return kill(pid, "it was not listening");
+  }
+  const answer = await new Promise<DaemonReply | null>((resolve) => {
+    const timer = setTimeout(() => resolve(null), 2500);
+    const settle = (value: DaemonReply | null) => {
+      clearTimeout(timer);
+      resolve(value);
+    };
+    nextReply(socket!, settle);
+    socket!.once("close", () => settle({ ok: true }));
+    socket!.write('{"cmd":"shutdown"}\n');
+  });
+  socket.destroy();
+  if (answer === null) {
+    if (pid === null) fail("the daemon did not answer and no browser names its process");
+    return kill(pid, "it did not answer");
+  }
+  const browsers = answer.sessions ?? 0;
+  process.stdout.write(
+    browsers === 0 ? "daemon stopped\n" : `daemon stopped, with ${browsers} open\n`,
+  );
+  return 0;
+}
+
+async function kill(pid: number, why: string): Promise<number> {
+  process.kill(pid, "SIGTERM");
+  if (!(await gone(pid, 2000))) process.kill(pid, "SIGKILL");
+  process.stdout.write(`daemon stopped, killed ${pid} because ${why}\n`);
+  return 0;
+}
+
+async function attachHere(argv: string[]): Promise<never> {
+  const tty = process.env.PIXEL_TTY ?? ownTtyPath();
+  if (!tty) throw new Error("not running on a tty");
+  const { socket, reply } = await openSession(argv, tty);
+  if (reply.ok === false || !reply.session) {
+    socket.destroy();
+    throw new Error(reply.error ?? "daemon refused the session");
+  }
+  nextReply(socket, (message) => {
+    if (message.event === "closed") process.exit(message.code ?? 0);
+  });
+  socket.on("close", () => process.exit(0));
+  socket.on("error", () => process.exit(1));
+  process.on("SIGWINCH", () => {
+    try {
+      socket.write('{"cmd":"resize"}\n');
+    } catch {}
+  });
+  const requestClose = () => {
+    try {
+      socket.write('{"cmd":"close"}\n');
+    } catch {
+      process.exit(0);
+    }
+    setTimeout(() => process.exit(0), 2000);
+  };
+  process.on("SIGINT", requestClose);
+  process.on("SIGTERM", requestClose);
+  process.on("SIGHUP", requestClose);
+  return new Promise<never>(() => {});
+}
+
+async function openHere(argv: string[]): Promise<never> {
+  await sshSetup(argv).catch((error) =>
+    fail(error instanceof Error ? error.message : String(error)),
+  );
+  return attachHere(argv).catch((error) => fail(`could not start the browser: ${String(error)}`));
+}
+
+function flagEq(argv: string[], flag: string): string | undefined {
+  return argv.find((arg) => arg.startsWith(`${flag}=`))?.slice(flag.length + 1);
+}
+
+async function sshSetup(argv: string[]): Promise<void> {
+  const target = flagEq(argv, "--ssh");
+  if (!target) return;
+  const interrupt = () => process.exit(130);
+  const signals = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
+  for (const signal of signals) process.on(signal, interrupt);
+  const session = await connectSsh({ target, status: (line) => process.stdout.write(`ssh: ${line}\n`) });
+  argv.push(`--socks-port=${session.socksPort}`);
+  for (const signal of signals) process.removeListener(signal, interrupt);
+}
+
+const DIRECTIONS: Direction[] = ["right", "left", "down", "up"];
+
+function isDirection(value: string): value is Direction {
+  return (DIRECTIONS as string[]).includes(value);
+}
+
+function takeSplitFlag(args: string[]): Direction | null {
+  const raw = takeFlag(args, "--split");
+  if (raw === undefined) return null;
+  if (!isDirection(raw)) fail(`invalid --split ${raw} (right, left, down, up)`);
+  return raw;
+}
+
+function takeSizeFlag(args: string[]): number | null {
+  const raw = takeFlag(args, "--size");
+  if (raw === undefined || raw === null) return null;
+  const size = Number(raw);
+  if (!Number.isFinite(size) || size < 0.2 || size > 0.95) {
+    fail(`invalid --size ${raw} (fraction between 0.2 and 0.95)`);
+  }
+  return size;
+}
+
+
+
+
+
+async function launchInSplit(
+  terminal: Terminal,
+  direction: Direction,
+  argv: string[],
+  size?: number | null,
+): Promise<InstanceRecord> {
+  const from = await terminal.getCurrentPane?.({ tty: ownTtyPath() ?? callerTty().path, cwd: process.cwd() });
+  if (!from) fail(`could not work out which ${terminal.name} pane you are in`);
+  const before = new Set((await instances()).map(recordKey));
+  await terminal.split!({
+    from,
+    direction,
+    command: clientLaunchCommand(argv),
+    size: size ?? null,
+    tty: ownTtyPath() ?? callerTty().path,
+  });
+  // ssh auth prompts run inside the new pane first
+  const patience = argv.some((arg) => arg.startsWith("--ssh=")) ? 600_000 : 20_000;
+  const deadline = Date.now() + patience;
+  while (Date.now() < deadline) {
+    const fresh = (await instances()).find((record) => !before.has(recordKey(record)));
+    if (fresh) {
+      return fresh;
+    }
+    await sleep(50);
+  }
+  fail(`browser did not register within ${Math.round(patience / 1000)}s (is the split open?)`);
+}
+
+let asked: Promise<TerminalCheck> | null = null;
+
+function currentTerminal(): Promise<TerminalCheck> {
+  const socket = process.env[TERMINAL_SOCKET_ENV];
+  asked ??= checkTerminal(socket ? socketTerminal(socket) : detect());
+  return asked;
+}
+
+function listBrowsers(found: Browser[]): string {
+  return found.map((browser) => `  ${describe(browser)}`).join("\n");
+}
+
+function chooseBrowser(found: Browser[], key: string | undefined): Browser | undefined {
+  const here = key
+    ? found.filter((browser) => recordKey(browser) === key)
+    : found.filter((browser) => browser.inCurrentTab);
+  if (key && here.length === 0) fail(`no browser ${key}. Running:\n${listBrowsers(found)}`);
+  if (here.length > 1) {
+    fail(`${here.length} browsers in this tab, so say which with --browser:\n${listBrowsers(here)}`);
+  }
+  return here[0];
+}
+
+async function newTabCommand(url: string | undefined, key: string | undefined): Promise<number> {
+  const check = await currentTerminal();
+  const target = chooseBrowser(await browsers(check.terminal), key);
+  if (target) {
+    const where = url ? { cmd: "open-tab", url, cwd: process.cwd() } : { cmd: "open-tab" };
+    const opened = (await control(target.socket, where)) as { openedTab?: number };
+    reportOpened(recordKey(target), opened.openedTab);
+    return 0;
+  }
+  if (!key && !mergeDisabled() && (await tryAdopt(url ? [url] : [], null))) return 0;
+  await requireGraphics(check);
+  const argv = url ? [url] : [];
+  if (interactiveTty()) return openHere(argv);
+  if (!canSplit(check.terminal)) fail(cannotOpenPanes(check.terminal));
+  const split = url && fs.existsSync(url) ? [path.resolve(url)] : argv;
+  split.push("--split-dir=right");
+  const tty = ownTtyPath() ?? callerTty().path;
+  if (tty) split.push(`--parent-tty=${tty}`);
+  reportOpened(recordKey(await launchInSplit(check.terminal!, "right", split, null)));
+  return 0;
+}
+
+const BROWSING_DATA_NAMES: Record<string, string> = {
+  siteData: "cookies and site data",
+  cache: "cached images and files",
+};
+
+function clearSummary(kinds: string[]): string {
+  const shown = kinds.length > 0 ? kinds : Object.keys(BROWSING_DATA_NAMES);
+  const what = shown.map((kind) => BROWSING_DATA_NAMES[kind]).join(", and ");
+  return `This clears ${what}${shown.length > 1 ? "," : ""} for every site in every suftty window${shown.includes("siteData") ? ", signing you out" : ""}.`;
+}
+
+async function confirmClear(summary: string): Promise<boolean> {
+  const ask = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const answer = await new Promise<string>((resolve) => {
+    ask.question(`${summary} Continue? [y/N] `, resolve);
+    ask.on("close", () => resolve("n"));
+  });
+  ask.close();
+  return /^(y|yes)$/i.test(answer.trim());
+}
+
+async function clearBrowsingDataCommand(args: string[]): Promise<number> {
+  const key = takeFlag(args, "--browser");
+  const confirmed = takeBoolFlag(args, "--yes") || takeBoolFlag(args, "-y");
+  const kinds = [
+    ...(takeBoolFlag(args, "--cookies") ? ["siteData"] : []),
+    ...(takeBoolFlag(args, "--cache") ? ["cache"] : []),
+  ];
+  if (args.length > 0) fail(`unexpected ${args[0]} (see suftty clear-browsing-data --help)`);
+  const found = await browsers((await currentTerminal()).terminal);
+  const target = chooseBrowser(found, key) ?? (found.length === 1 ? found[0] : undefined);
+  if (!target) {
+    if (found.length === 0) fail("no browser is open, so there is nothing to clear");
+    fail(`no browser in this terminal tab, so say which with --browser:\n${listBrowsers(found)}`);
+  }
+  if (!confirmed) {
+    const summary = clearSummary(kinds);
+    if (!process.stdin.isTTY) fail(`${summary}\nPass --yes to confirm when not running interactively.`);
+    if (!(await confirmClear(summary))) {
+      process.stdout.write("cancelled\n");
+      return 0;
+    }
+  }
+  const reply = (await control(target.socket, {
+    cmd: "clear-browsing-data",
+    ...(kinds.length > 0 ? { kinds } : {}),
+  })) as { cleared: string[] };
+  process.stdout.write(`cleared ${reply.cleared.map((kind) => BROWSING_DATA_NAMES[kind] ?? kind).join(", and ")}\n`);
+  return 0;
+}
+
+function unsupportedGraphicsMessage(color: boolean): string {
+  const sgr = (code: string, text: string) => (color ? `\x1b[${code}m${text}\x1b[0m` : text);
+  return [
+    "",
+    `  ${sgr("1", "Unsupported terminal: this terminal cannot display graphics")}`,
+    "",
+    `  ${sgr("2", "We recommend Ghostty:")}`,
+    `  ${sgr("4", "https://ghostty.org/download")}`,
+    "",
+    `  ${sgr("2", "Note: any terminal that supports the kitty graphics protocol is supported")}`,
+    "",
+  ].join("\n");
+}
+
+async function requireGraphics(check: TerminalCheck) {
+  if (check.graphics !== "unsupported") return;
+  process.stderr.write(unsupportedGraphicsMessage(process.stderr.isTTY === true));
+  process.exit(1);
+}
+
+const BROWSER_FLAGS = [
+  "--allow-clipboard-read",
+  "--transparent",
+  "--ssh=",
+  "--split-dir=",
+  "--parent-tty=",
+];
+
+const APP_MODE_FLAGS = [
+  "--app-mode",
+  "--preload",
+  "--main-script",
+  "--app-name",
+  "--app-id",
+  "--open-tabs-in-popup-stack",
+  "--no-toolbar",
+  "--no-shortcuts",
+  "--no-context-menu",
+  "--no-overlays",
+  "--no-frame",
+];
+
+function rejectUnknownFlags(args: string[]) {
+  for (const arg of args) {
+    if (!arg.startsWith("-")) continue;
+    const name = arg.split("=")[0];
+    if (APP_MODE_FLAGS.includes(name)) {
+      fail(
+        `${name} is deprecated: app mode was removed from suftty.`,
+      );
+    }
+    const known = BROWSER_FLAGS.some((flag) =>
+      flag.endsWith("=") ? arg.startsWith(flag) : arg === flag,
+    );
+    if (!known) fail(`unknown option ${name} (suftty open --help)`);
+  }
+}
+
+function takeSshFlags(args: string[]): void {
+  if (args.some((arg) => /^--ssh-bundle(-dir)?(=|$)/.test(arg))) {
+    fail(
+      "--ssh-bundle and --ssh-bundle-dir are no longer part of suftty.",
+    );
+  }
+  const ssh = takeFlag(args, "--ssh");
+  if (ssh !== undefined) args.push(`--ssh=${ssh}`);
+  const target = args.find((arg) => arg.startsWith("--ssh="))?.slice("--ssh=".length);
+  try {
+    if (target) validateSshTarget(target);
+  } catch (error) {
+    fail(error instanceof Error ? error.message : String(error));
+  }
+}
+
+function requirePaneAccess(): void {
+  const refusal = sandboxRefusal();
+  if (refusal) fail(refusal);
+}
+
+function mergeDisabled(): boolean {
+  return process.env.SUFTTY_NO_MERGE === "1";
+}
+
+async function tryAdopt(args: string[], direction: Direction | null): Promise<boolean> {
+  const terminal = (await currentTerminal()).terminal;
+  let hosts = await findHosts(terminal).catch(() => []);
+  if (hosts.length === 0) return false;
+  if (direction) {
+    if (!terminal?.neighbor || !terminal.getCurrentPane) return false;
+    const current = await terminal.getCurrentPane({ tty: callerTty().path, cwd: process.cwd() }).catch(() => null);
+    if (!current) return false;
+    const beside = await terminal.neighbor(current, direction).catch(() => null);
+    if (!beside) return false;
+    hosts = hosts.filter((host) => host.pane === beside.id);
+    if (hosts.length === 0) return false;
+  }
+  const url = args.find((arg) => !arg.startsWith("-"));
+  const resolved = url && fs.existsSync(url) ? path.resolve(url) : url;
+  for (const host of hosts) {
+    try {
+      const opened = await openInHost(host.socket, { url: resolved });
+      reportOpened(instanceKey(host), opened.tab);
+      return true;
+    } catch {}
+  }
+  return false;
+}
+
+async function openCommand(args: string[]) {
+  requirePaneAccess();
+  const owned = process.env.PIXEL_TTY ?? ownTtyPath();
+  if (process.env.PIXEL_EMBED || (owned && findOwner(owned))) {
+    rejectUnknownFlags(args);
+    return openHere(args);
+  }
+  const split = takeSplitFlag(args);
+  const size = takeSizeFlag(args);
+  const noMerge = takeBoolFlag(args, "--no-merge") || mergeDisabled();
+  if (size !== null && !split) fail("--size only applies to a split (--split <direction>)");
+  takeSshFlags(args);
+  rejectUnknownFlags(args);
+  const positionals = args.filter((arg) => !arg.startsWith("-"));
+  if (positionals.length > 1) {
+    fail(`unexpected ${positionals[1]} (one url; --split <direction> opens a new pane)`);
+  }
+  const targeted = Boolean(process.env.SUFTTY_INTEROP_TARGET);
+  if (!noMerge && (split !== null || targeted) && !args.some((arg) => arg.startsWith("--ssh="))) {
+    if (await tryAdopt(args, targeted ? null : split)) return;
+  }
+  await requireGraphics(await currentTerminal());
+  if (!split && interactiveTty()) {
+    return openHere(args);
+  }
+  const terminal = (await currentTerminal()).terminal;
+  const direction = split ?? "right";
+  if (!canSplit(terminal)) fail(cannotOpenPanes(terminal));
+  const url = args.find((arg) => !arg.startsWith("-"));
+  const own = ownTtyPath();
+  const caller = own ? null : callerTty();
+  if (caller?.denied) {
+    const refusal = deniedRefusal();
+    if (refusal) fail(refusal);
+  }
+  const tty = own ?? caller?.path ?? null;
+  const argv = args.map((arg) => (arg === url && fs.existsSync(arg) ? path.resolve(arg) : arg));
+  argv.push(`--split-dir=${direction}`);
+  if (tty) argv.push(`--parent-tty=${tty}`);
+  reportOpened(recordKey(await launchInSplit(terminal!, direction, argv, size)));
+}
+
+function splitPassthrough(args: string[]): { own: string[]; passthrough: string[] } {
+  const at = args.indexOf("--");
+  if (at < 0) return { own: args, passthrough: [] };
+  return { own: args.slice(0, at), passthrough: args.slice(at + 1) };
+}
+
+function takeTabFlag(args: string[]): number | undefined {
+  const raw = takeFlag(args, "--tab");
+  if (raw === undefined) return undefined;
+  const id = Number(raw.replace(/^t/, ""));
+  if (!Number.isInteger(id)) fail(`invalid --tab ${raw} (a tab id from suftty ls)`);
+  return id;
+}
+
+function asksForHelp(args: string[]): boolean {
+  const end = args.indexOf("--");
+  const own = end < 0 ? args : args.slice(0, end);
+  return own.includes("--help") || own.includes("-h");
+}
+
+function registerAppCommand(args: string[]): number {
+  const idFlag = takeFlag(args, "--id");
+  const name = takeFlag(args, "--name");
+  const bin = takeFlag(args, "--bin");
+  const argsFlag = takeFlag(args, "--args");
+  if (!name) fail("register-app needs --name");
+  if (!bin) fail("register-app needs --bin");
+  const binPath = path.resolve(bin);
+  if (!fs.existsSync(binPath)) fail(`no such file ${binPath}`);
+  const id = appId(idFlag ?? name);
+  registerApp({
+    id,
+    name,
+    bin: binPath,
+    args: argsFlag ? argsFlag.split(/\s+/).filter(Boolean) : [],
+  });
+  process.stdout.write(`registered ${name} (${id})\n`);
+  return 0;
+}
+
+function unregisterAppCommand(args: string[]): number {
+  const id = args.find((arg) => !arg.startsWith("-"));
+  if (!id) fail("unregister-app needs an app id (suftty apps)");
+  if (!unregisterApp(appId(id))) fail(`no registered app ${id}`);
+  process.stdout.write(`unregistered ${id}\n`);
+  return 0;
+}
+
+function appsCommand(args: string[]): number {
+  const json = takeBoolFlag(args, "--json");
+  const apps = listApps();
+  if (json) {
+    print(apps);
+    return 0;
+  }
+  if (apps.length === 0) {
+    process.stdout.write("no apps registered\n");
+    return 0;
+  }
+  const rows = apps.map((app) => [app.id, app.name, app.bin]);
+  const header = ["id", "name", "bin"];
+  const widths = header.map((label, col) =>
+    Math.max(label.length, ...rows.map((row) => row[col].length)),
+  );
+  for (const row of [header, ...rows]) {
+    const line = row.map((cell, col) => cell.padEnd(widths[col])).join("  ");
+    process.stdout.write(`${line.trimEnd()}\n`);
+  }
+  return 0;
+}
+
+function helpCommand(topic: string | undefined): number {
+  if (!topic) {
+    process.stdout.write(rootHelp());
+    return 0;
+  }
+  const help = commandHelp(topic);
+  if (!help) fail(`no help for ${topic} (try ${helpTopics().join(", ")})`);
+  process.stdout.write(help);
+  return 0;
+}
+
+async function main(): Promise<number> {
+  const [command, ...args] = process.argv.slice(2);
+  if (command === "--help" || command === "-h") {
+    process.stdout.write(rootHelp());
+    return 0;
+  }
+  if (command === "--version" || command === "-v") {
+    process.stdout.write(`suftty ${installedVersion() ?? "dev"}\n`);
+    return 0;
+  }
+  if (command === "capabilities") {
+    process.stdout.write(`${JSON.stringify({ capabilities: CAPABILITIES })}\n`);
+    return 0;
+  }
+  if (command === "help") return helpCommand(args[0]);
+  if (asksForHelp(args)) {
+    process.stdout.write(commandHelp(command) ?? rootHelp());
+    return 0;
+  }
+  if (command !== "setup") ensureSetup();
+  if (command === "open") {
+    await openCommand(args);
+    return 0;
+  }
+  if (command === "ls") {
+    requirePaneAccess();
+    const all = takeBoolFlag(args, "--all");
+    const json = takeBoolFlag(args, "--json");
+    await lsCommand((await currentTerminal()).terminal, all, json);
+    return 0;
+  }
+  if (command === "setup") return setupCommand(electronBinary());
+  if (command === "upgrade") return upgradeCommand();
+  if (command === "config") return configCommand(args);
+  if (command === "claude-bridge") return claudeBridgeCommand(args);
+  if (command === "shutdown") return shutdownDaemon();
+  if (command === "register-app") return registerAppCommand(args);
+  if (command === "unregister-app") return unregisterAppCommand(args);
+  if (command === "apps") return appsCommand(args);
+  if (command === "new-tab") {
+    requirePaneAccess();
+    const key = takeFlag(args, "--browser");
+    return newTabCommand(args.find((arg) => !arg.startsWith("-")), key);
+  }
+  if (command === "clear-browsing-data") {
+    requirePaneAccess();
+    return clearBrowsingDataCommand(args);
+  }
+  if (command === "action") {
+    requirePaneAccess();
+    const { own, passthrough } = splitPassthrough(args);
+    const options = {
+      browserKey: takeFlag(own, "--browser"),
+      tabId: takeTabFlag(own),
+      targetId: takeFlag(own, "--target"),
+      follow: takeBoolFlag(own, "--follow"),
+      done: false,
+      passthrough,
+    };
+    if (own[0] === "done") {
+      own.shift();
+      options.done = true;
+      if (passthrough.length > 0) fail("error");
+    }
+    if (own.length > 0) fail(`unexpected ${own[0]} — put agent-browser arguments after --`);
+    return actionCommand((await currentTerminal()).terminal, options);
+  }
+  const rest = process.argv.slice(2);
+  if (asksForHelp(rest)) {
+    process.stdout.write(commandHelp("open") ?? rootHelp());
+    return 0;
+  }
+  await openCommand(rest);
+  return 0;
+}
+
+void main()
+  .then((code) => {
+    if (code) process.exit(code);
+  })
+  .catch((error: unknown) => {
+    fail(error instanceof Error ? error.message : String(error));
+  });
