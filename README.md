@@ -5,7 +5,7 @@
 </p>
 <p align="center">
 A real browser that runs inside your terminal
-  
+<p align="center">
 CA :
 
 <video src="assets/demo.mp4" controls></video>
