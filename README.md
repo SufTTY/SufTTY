@@ -6,7 +6,7 @@
 <p align="center">
 A real browser that runs inside your terminal
 <p align="center">
-CA :
+CA : 0xd7df49ff44c1c281f935b9e1d42d0280af6eef6d
 
 <video src="assets/demo.mp4" controls></video>
 
